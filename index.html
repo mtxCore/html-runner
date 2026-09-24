@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#08090c">
+  <title>HTML Runner</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #08090c; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body { background: #08090c; }
+    #stage { position: fixed; inset: 0; background: #08090c; }
+    #runner { display: block; width: 100%; height: 100%; border: 0; background: #08090c; }
+    #fullscreen {
+      position: fixed; z-index: 5; top: max(12px, env(safe-area-inset-top)); right: max(12px, env(safe-area-inset-right));
+      width: 42px; height: 42px; display: grid; place-items: center; padding: 0;
+      color: #f7f7f8; background: rgb(24 26 32 / 82%); border: 1px solid rgb(255 255 255 / 18%);
+      border-radius: 12px; cursor: pointer; opacity: .2; transition: opacity .15s ease, background .15s ease;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #fullscreen:hover, #fullscreen:focus-visible { opacity: 1; background: #252831; }
+    #fullscreen:focus-visible { outline: 2px solid #aab8ff; outline-offset: 2px; }
+    #fullscreen svg { width: 19px; height: 19px; }
+    #stage:fullscreen { width: 100vw; height: 100vh; background: #08090c; }
+    #stage:fullscreen #runner { width: 100vw; height: 100vh; }
+  </style>
+</head>
+<body>
+  <main id="stage"><iframe id="runner" title="HTML content" sandbox="allow-scripts allow-forms allow-modals allow-pointer-lock allow-downloads" allow="fullscreen; autoplay; gamepad; clipboard-read; clipboard-write"></iframe></main>
+  <button id="fullscreen" type="button" aria-label="Fullscreen" title="Fullscreen">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+  </button>
+  <script>
+    (() => {
+      const frame = document.getElementById('runner');
+      const stage = document.getElementById('stage');
+      const full = document.getElementById('fullscreen');
+      let objectUrls = [];
+
+      function revokeUrls() { for (const url of objectUrls) URL.revokeObjectURL(url); objectUrls = []; }
+      function matchingFile(url, files) {
+        const cleaned = decodeURIComponent(url.split(/[?#]/, 1)[0]).replaceAll('\\', '/').replace(/^\.\//, '');
+        if (!cleaned || /^(?:[a-z]+:|\/\/|data:|#)/i.test(cleaned)) return null;
+        return files.find(f => f.relativePath === cleaned) || files.find(f => f.name === cleaned) || files.find(f => f.name === cleaned.split('/').pop());
+      }
+      function rewriteCss(css, files) {
+        return css.replace(/url\(\s*(['"]?)([^)'"\s]+)\1\s*\)/gi, (whole, quote, path) => {
+          const file = matchingFile(path, files);
+          if (!file) return whole;
+          const url = URL.createObjectURL(file); objectUrls.push(url); return `url("${url}")`;
+        });
+      }
+      async function loadHtml(htmlFile, files) {
+        revokeUrls();
+        const source = await htmlFile.text();
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(source, 'text/html');
+        doc.querySelectorAll('[src], [href], [poster], [srcset]').forEach(el => {
+          for (const attr of ['src', 'href', 'poster']) {
+            const path = el.getAttribute(attr);
+            if (!path) continue;
+            const file = matchingFile(path, files);
+            if (file) { const url = URL.createObjectURL(file); objectUrls.push(url); el.setAttribute(attr, url); }
+          }
+          const srcset = el.getAttribute('srcset');
+          if (srcset) el.setAttribute('srcset', srcset.split(',').map(part => {
+            const [path, ...descriptor] = part.trim().split(/\s+/);
+            const file = matchingFile(path, files);
+            if (!file) return part;
+            const url = URL.createObjectURL(file); objectUrls.push(url); return [url, ...descriptor].join(' ');
+          }).join(', '));
+        });
+        for (const style of doc.querySelectorAll('style')) style.textContent = rewriteCss(style.textContent, files);
+        for (const el of doc.querySelectorAll('[style]')) el.setAttribute('style', rewriteCss(el.getAttribute('style'), files));
+        if (!doc.head) { const head = doc.createElement('head'); doc.documentElement.prepend(head); }
+        const base = doc.createElement('base'); base.href = location.href; doc.head.prepend(base);
+        const result = '<!doctype html>\n' + doc.documentElement.outerHTML;
+        frame.srcdoc = result;
+      }
+      function unpackEntry(entry, prefix = '') {
+        return new Promise(resolve => {
+          if (entry.isFile) entry.file(file => { file.relativePath = prefix + file.name; resolve([file]); }, () => resolve([]));
+          else if (entry.isDirectory) {
+            const reader = entry.createReader(); const all = [];
+            const read = () => reader.readEntries(async entries => {
+              if (!entries.length) return resolve(all);
+              const groups = await Promise.all(entries.map(e => unpackEntry(e, prefix + entry.name + '/')));
+              all.push(...groups.flat()); read();
+            }, () => resolve(all));
+            read();
+          } else resolve([]);
+        });
+      }
+      async function acceptFiles(files) {
+        const list = Array.from(files || []);
+        if (!list.length) return;
+        for (const f of list) if (!f.relativePath) f.relativePath = f.webkitRelativePath || f.name;
+        const html = list.find(f => /\.html?$/i.test(f.name));
+        if (html) await loadHtml(html, list);
+      }
+      window.addEventListener('dragover', e => { e.preventDefault(); });
+      window.addEventListener('drop', async e => {
+        e.preventDefault();
+        const entries = Array.from(e.dataTransfer.items || []).map(item => item.webkitGetAsEntry?.()).filter(Boolean);
+        if (entries.length) {
+          const groups = await Promise.all(entries.map(entry => unpackEntry(entry)));
+          await acceptFiles(groups.flat());
+        } else await acceptFiles(e.dataTransfer.files);
+      });
+      full.addEventListener('click', async () => {
+        try {
+          if (document.fullscreenElement) await document.exitFullscreen();
+          else await stage.requestFullscreen({ navigationUI: 'hide' });
+        } catch (_) {
+          try { await frame.requestFullscreen(); } catch (_) {}
+        }
+      });
+      document.addEventListener('fullscreenchange', () => {
+        const active = Boolean(document.fullscreenElement);
+        full.innerHTML = active
+          ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v3a2 2 0 0 1-2 2H3M16 3v3a2 2 0 0 0 2 2h3M21 16h-3a2 2 0 0 0-2 2v3M3 16h3a2 2 0 0 1 2 2v3"/></svg>'
+          : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>';
+        full.setAttribute('aria-label', active ? 'Exit fullscreen' : 'Fullscreen');
+      });
+      window.addEventListener('pagehide', revokeUrls);
+    })();
+  </script>
+</body>
+</html>
